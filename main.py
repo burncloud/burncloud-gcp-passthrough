@@ -5,7 +5,7 @@ import httpx
 import logging
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google.oauth2 import service_account
 import google.auth.transport.requests
 from dotenv import load_dotenv
@@ -112,20 +112,27 @@ async def proxy_vertex_predict(
     路径示例: 
     - /v1/vertex/veo-001-preview:predict
     - /v1/vertex/gemini-1.5-flash-001:generateContent
+    - /v1/vertex/gemini-1.5-flash-001:streamGenerateContent
     """
     # 1. 获取客户原始请求体
+    # 对于流式请求，我们依然需要读取 body 转发给 Google
     try:
         client_payload = await request.json()
     except json.JSONDecodeError:
          raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # 2. 审计日志 (Shadow Auditing)
-    # 注意：不要打印过大的 payload，这里只记录元数据
+    # 2. 审计日志
     logger.info(f"Proxying request for model: {model_name}, method: {method_name} by user: {VALID_API_KEYS[api_key]['name']}")
     
     # 3. 构造 Google 上游地址
     # 官方格式: https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{REGION}/publishers/google/models/{MODEL}:{METHOD}
-    google_url = f"https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{REGION}/publishers/google/models/{model_name}:{method_name}"
+    # 特殊处理: 如果 REGION 是 'global'，则 hostname 不带前缀，直接是 aiplatform.googleapis.com
+    if REGION == "global":
+        base_url = "https://aiplatform.googleapis.com"
+    else:
+        base_url = f"https://{REGION}-aiplatform.googleapis.com"
+        
+    google_url = f"{base_url}/v1/projects/{PROJECT_ID}/locations/{REGION}/publishers/google/models/{model_name}:{method_name}"
     
     # 4. 获取 GCP Token
     try:
@@ -134,47 +141,87 @@ async def proxy_vertex_predict(
         logger.error(f"Token generation failed: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error: GCP Auth Failed")
 
-    # 5. 发送请求给 Google
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                google_url,
-                json=client_payload,
-                headers={
-                    "Authorization": f"Bearer {gcp_token}",
-                    "Content-Type": "application/json"
-                },
-                timeout=120.0 # 视频生成通常需要较长时间
-            )
-        except httpx.RequestError as exc:
-            logger.error(f"Request to Google failed: {exc}")
-            raise HTTPException(status_code=502, detail=f"Upstream connection failed: {str(exc)}")
+    # 5. 判断是否需要流式处理
+    # Vertex AI 的流式接口通常是 streamGenerateContent 或 streamRawPredict
+    is_streaming = "stream" in method_name.lower()
 
-    # 6. 记录响应状态
-    logger.info(f"Google response status: {response.status_code}")
-    if response.status_code >= 400:
-        logger.error(f"Upstream Error Body: {response.text}")
+    if is_streaming:
+        async def upstream_generator():
+            async with httpx.AsyncClient() as client:
+                try:
+                    async with client.stream(
+                        "POST",
+                        google_url,
+                        json=client_payload,
+                        headers={
+                            "Authorization": f"Bearer {gcp_token}",
+                            "Content-Type": "application/json"
+                        },
+                        timeout=120.0
+                    ) as response:
+                        # 检查上游状态码
+                        if response.status_code >= 400:
+                            # 如果上游报错，尝试读取错误信息并记录
+                            error_body = await response.aread()
+                            logger.error(f"Upstream Streaming Error: {response.status_code} - {error_body.decode('utf-8', errors='replace')}")
+                            # 这里 yield 一个错误 JSON，或者让客户端处理非 200 响应
+                            yield error_body
+                            return
 
-    # 7. 透传响应
-    # 使用 JSONResponse 确保 Content-Type 正确
-    try:
-        response_content = response.json()
-    except json.JSONDecodeError:
-        # 如果 Google 返回 404 HTML 或其他非 JSON 内容，避免 crash
-        logger.warning(f"Upstream returned non-JSON response. Status: {response.status_code}")
-        return JSONResponse(
-            content={
-                "error": "Upstream returned non-JSON response", 
-                "upstream_status": response.status_code,
-                "details": response.text
-            },
-            status_code=response.status_code
+                        # 正常流式传输
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                except httpx.RequestError as exc:
+                    logger.error(f"Stream connection failed: {exc}")
+                    yield json.dumps({"error": f"Stream connection failed: {str(exc)}"}).encode()
+
+        return StreamingResponse(
+            upstream_generator(),
+            media_type="application/json" 
+            # Vertex AI streamGenerateContent 返回的是 chunked JSON 数组，ContentType 也是 application/json
+            # 也可以设为 "application/x-ndjson" 如果客户端更喜欢那样，但保持原样最安全
         )
 
-    return JSONResponse(
-        content=response_content,
-        status_code=response.status_code
-    )
+    else:
+        # 非流式（标准）请求
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    google_url,
+                    json=client_payload,
+                    headers={
+                        "Authorization": f"Bearer {gcp_token}",
+                        "Content-Type": "application/json"
+                    },
+                    timeout=120.0 
+                )
+            except httpx.RequestError as exc:
+                logger.error(f"Request to Google failed: {exc}")
+                raise HTTPException(status_code=502, detail=f"Upstream connection failed: {str(exc)}")
+
+        # 6. 记录响应状态
+        logger.info(f"Google response status: {response.status_code}")
+        if response.status_code >= 400:
+            logger.error(f"Upstream Error Body: {response.text}")
+
+        # 7. 透传响应
+        try:
+            response_content = response.json()
+        except json.JSONDecodeError:
+            logger.warning(f"Upstream returned non-JSON response. Status: {response.status_code}")
+            return JSONResponse(
+                content={
+                    "error": "Upstream returned non-JSON response", 
+                    "upstream_status": response.status_code,
+                    "details": response.text
+                },
+                status_code=response.status_code
+            )
+
+        return JSONResponse(
+            content=response_content,
+            status_code=response.status_code
+        )
 
 if __name__ == "__main__":
     import uvicorn

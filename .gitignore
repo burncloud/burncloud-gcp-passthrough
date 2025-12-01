@@ -1,2 +1,16 @@
-test.md
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
 .env
+*.log
+nohup.out
+*.json
+!package.json
+.pytest_cache/
+.coverage
+htmlcov/
+vertex_test_report.md
