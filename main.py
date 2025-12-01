@@ -8,6 +8,10 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 import google.auth.transport.requests
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- Configuration ---
 # 从环境变量读取，如果不存在则使用默认值（生产环境建议强制使用环境变量）
@@ -17,11 +21,13 @@ PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id") # 替换为您的 GC
 REGION = os.getenv("GCP_REGION", "us-central1")
 
 # 简单的 API Key 存储 (实际生产环境应替换为数据库查询)
-# 格式: "sk-xxx": {"balance": 1000, "rpm_limit": 50}
-VALID_API_KEYS = {
-    "sk-client-veo-001": {"name": "VIP Client A", "active": True},
-    "sk-burncloud-admin": {"name": "Admin Test", "active": True}
-}
+# 从 .env 读取 JSON 字符串格式的 API Keys
+# 格式: '{"sk-xxx": {"name": "...", "active": true}}'
+try:
+    VALID_API_KEYS = json.loads(os.getenv("VALID_API_KEYS", "{}"))
+except json.JSONDecodeError as e:
+    print(f"Error parsing VALID_API_KEYS from .env: {e}")
+    VALID_API_KEYS = {}
 
 # --- Logging ---
 logging.basicConfig(
@@ -93,16 +99,19 @@ async def verify_api_key(request: Request):
 async def health_check():
     return {"status": "ok", "service": "burncloud-gcp-proxy"}
 
-@app.post("/v1/vertex/{model_name}:predict")
+@app.post("/v1/vertex/{model_name}:{method_name}")
 async def proxy_vertex_predict(
-    model_name: str, 
+    model_name: str,
+    method_name: str,
     request: Request, 
     api_key: str = Depends(verify_api_key)
 ):
     """
-    通用的 Vertex AI Predict 接口透传
+    通用的 Vertex AI 接口透传
     支持 Veo (Video), Gemini (Text/Multimodal) 等
-    路径示例: /v1/vertex/veo-001-preview:predict
+    路径示例: 
+    - /v1/vertex/veo-001-preview:predict
+    - /v1/vertex/gemini-1.5-flash-001:generateContent
     """
     # 1. 获取客户原始请求体
     try:
@@ -112,11 +121,11 @@ async def proxy_vertex_predict(
 
     # 2. 审计日志 (Shadow Auditing)
     # 注意：不要打印过大的 payload，这里只记录元数据
-    logger.info(f"Proxying request for model: {model_name} by user: {VALID_API_KEYS[api_key]['name']}")
+    logger.info(f"Proxying request for model: {model_name}, method: {method_name} by user: {VALID_API_KEYS[api_key]['name']}")
     
     # 3. 构造 Google 上游地址
-    # 官方格式: https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{REGION}/publishers/google/models/{MODEL}:predict
-    google_url = f"https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{REGION}/publishers/google/models/{model_name}:predict"
+    # 官方格式: https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{REGION}/publishers/google/models/{MODEL}:{METHOD}
+    google_url = f"https://{REGION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{REGION}/publishers/google/models/{model_name}:{method_name}"
     
     # 4. 获取 GCP Token
     try:
