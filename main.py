@@ -157,8 +157,22 @@ async def proxy_vertex_predict(
 
     # 7. 透传响应
     # 使用 JSONResponse 确保 Content-Type 正确
+    try:
+        response_content = response.json()
+    except json.JSONDecodeError:
+        # 如果 Google 返回 404 HTML 或其他非 JSON 内容，避免 crash
+        logger.warning(f"Upstream returned non-JSON response. Status: {response.status_code}")
+        return JSONResponse(
+            content={
+                "error": "Upstream returned non-JSON response", 
+                "upstream_status": response.status_code,
+                "details": response.text
+            },
+            status_code=response.status_code
+        )
+
     return JSONResponse(
-        content=response.json(),
+        content=response_content,
         status_code=response.status_code
     )
 
